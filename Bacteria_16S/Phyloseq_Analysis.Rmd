@@ -1,0 +1,220 @@
+---
+title: "Amplicon Sequencing Analysis"
+author: "Beatrice Severance, Zachary Noel"
+date: "2023-1-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+## Load Dependencies
+```{r include = FALSE}
+library(phyloseq)
+library(vegan)
+library(tidyverse)
+library(ggplot2)
+library(Biostrings)
+library(ggpubr)
+library(decontam)
+library(metagenomeSeq)
+library(indicspecies)
+```
+## Colorblind Palette
+```{r include = FALSE}
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+## Load files from HPC to create a phyloseq object
+```{r include = FALSE}
+# Taxonomy 
+tax <- read.delim("16s_taxonomy.csv", header = T, row.names = 1, sep = ",")
+head(tax)
+tax$OTU <- rownames(tax)
+TAX.bacteria <- phyloseq::tax_table(as.matrix(tax))
+
+# OTU Table 
+table <- read.csv("otu_table_16s.csv")
+rownames(table) <- table$OTU_ID
+table <- table[,-1]
+OTU.bacteria <- phyloseq::otu_table(table, taxa_are_rows = TRUE)
+
+# Metadata 
+samples <- read.csv("metadata2021.csv")
+rownames(samples) <- samples$Sample_ID #row names must match OTU table headers
+SAMP.bacteria <- phyloseq::sample_data(samples)
+
+# Fasta File
+FASTA.bacteria <- Biostrings::readDNAStringSet("otus.fasta", format="fasta", seek.first.rec=TRUE, use.names=TRUE)
+
+# Phyloseq Object Creation
+phyloseq.start <- phyloseq(SAMP.bacteria, TAX.bacteria, OTU.bacteria, FASTA.bacteria)
+
+phyloseq.start@otu_table # the OTU table
+phyloseq.start@tax_table # the taxonomy table
+phyloseq.start@sam_data # the metadata
+phyloseq.start@refseq # the sequences
+```
+## Analysis
+```{r include=FALSE}
+# Removing mitochondria/chloroplasts or taxa not assigned at the domain level
+physeq.no.mito <- phyloseq.start %>% subset_taxa(Family!= "Mitochondria" & Family!= "Chloroplast" & Domain!= "unidentified")
+
+no.mito.no.positive <- physeq.no.mito %>% 
+  subset_samples(Control %in% c("Negative Control", "Sample"))
+```
+## Decontamination
+```{r include=FALSE}
+#Use the full dataset to call contaminants, then remove them, if they exist in the non plant OTU dataset
+sample_data(no.mito.no.positive)$is.neg <- sample_data(no.mito.no.positive)$Control == "Sample"
+contamdf.prev <- isContaminant(no.mito.no.positive, method="prevalence", neg="is.neg", threshold = 0.1, normalize = TRUE)
+badTaxa <- rownames(contamdf.prev[contamdf.prev$contaminant == TRUE,])
+
+print(badTaxa)
+```
+```{r include=FALSE}
+# transform data to presence absence
+ps.pa <- transform_sample_counts(no.mito.no.positive, function(abund) 1*(abund>0))
+
+# making a dataframe for both negative and positive samples.
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$Control == "Negative Control", ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$Control == "Sample", ps.pa)
+
+# Make data.frame of prevalence in positive and negative samples
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                    contaminant=contamdf.prev$contaminant)
+decontaminated <- ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)") + 
+  theme_classic() + 
+  scale_color_manual(values = c(cbbPalette[[1]], cbbPalette[[2]]))
+
+physeq.clean.samples <- physeq.no.mito %>% 
+  subset_samples(Control == "Sample") %>%
+  phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) %>%
+  subset_samples(Fungicide %in% c("Control", "Fungicide"))
+```
+```{r include=FALSE}
+# Look at the read distribution per sample and decide whether to get rid of some samples with low sequence depth
+# a good general rule of thumb is samples below 1000 reads could be eliminated, although this isn't a hard rule, you can remove at 10,000 or more if you want
+sort(sample_sums(physeq.clean.samples), decreasing = T) # read distribution
+
+# New number of total reads
+sum(sample_sums(physeq.clean.samples))
+
+# Mean and median read depth 
+mean(sample_sums(physeq.clean.samples))
+
+median(sample_sums(physeq.clean.samples))
+```
+## Histogram of read distribution
+```{r include=TRUE}
+# Histogram including median read depth
+read.depths <- data.frame(sample_sums(physeq.clean.samples))
+colnames(read.depths) <- "read.depth"
+read.depth.plot <- ggplot(read.depths, aes(read.depth)) +
+  geom_histogram(fill = cbbPalette[[3]], color = "black") + 
+  geom_vline(xintercept = median(sample_sums(physeq.clean.samples)), linetype = "dashed") + 
+  theme_classic() + 
+  xlab("Read Depth")
+
+print(read.depth.plot)
+```
+## Rarefaction Analysis
+```{r include=TRUE}
+sam.data <- data.frame(physeq.clean.samples@sam_data)
+pOTU.table <- physeq.clean.samples@otu_table
+S <- specnumber(t(pOTU.table)) # observed number of species
+raremax <- min(rowSums(t(pOTU.table)))
+Srare <- rarefy(t(pOTU.table), raremax)
+rare.fun <- rarecurve(t(pOTU.table), step = 1000, sample = raremax, col = "blue", cex = 0.6)
+
+prok.rare.curve.extract <- NULL
+for(i in 1:length(rare.fun)){
+  sample.200 <- data.frame(rare.spec = rare.fun[[i]])
+  sample.200$read_depth <- attr(rare.fun[[i]], "Subsample")
+  sample.200$Sample_ID <- rownames(t(pOTU.table[,i]))
+  prok.rare.curve.extract <- rbind.data.frame(prok.rare.curve.extract, sample.200)
+}
+prok.rare.curve.extract2 <- left_join(sam.data, prok.rare.curve.extract, by = "Sample_ID")
+
+rare.curve <- ggplot(prok.rare.curve.extract2, aes(x = read_depth, y = rare.spec, group = Sample_ID)) + 
+  #geom_point() +
+  geom_line(color = "grey") + 
+  xlab("Reads") + 
+  ylab("Number of OTUs") + 
+  theme_classic() + 
+  geom_vline(xintercept = median(sample_sums(physeq.clean.samples)), linetype = "dashed")
+
+print(rare.curve)
+```
+## Alpha Diversity
+```{r include=TRUE}
+physeq.clean.samples@sam_data$shannon <- estimate_richness(physeq.clean.samples, measures=c("Shannon"))$Shannon
+physeq.clean.samples@sam_data$invsimpson <- estimate_richness(physeq.clean.samples, measures=c("InvSimpson"))$InvSimpson
+physeq.clean.samples@sam_data$richness <- estimate_richness(physeq.clean.samples, measures=c("Observed"))$Observed
+physeq.clean.samples@sam_data$even <- physeq.clean.samples@sam_data$shannon/log(physeq.clean.samples@sam_data$richness)
+
+sample.data.fungi <- data.frame(physeq.clean.samples@sam_data)
+
+#Richness over time
+richness.time <- ggplot(sample.data.fungi, aes(x = Time, y = richness)) + 
+  geom_boxplot() +
+  geom_jitter() + 
+  ylab("Richness") +
+  stat_compare_means(method = "anova") + 
+  xlab("")+
+  theme_classic()
+print(richness.time)
+
+#Richness over treatment
+richness.management <- ggplot(sample.data.fungi, aes(x = Fungicide, y = richness)) + 
+  geom_boxplot() +
+  geom_jitter() + 
+  ylab("Richness") + 
+  stat_compare_means(method = "anova") + 
+  xlab("")+
+  theme_classic() +
+  facet_wrap(~ Cultivar * Time)
+print(richness.management)
+```
+##Cumulative sum scaling (CSS) Normalization
+```{r include=FALSE}
+MGS <- phyloseq_to_metagenomeSeq(physeq.clean.samples)
+p <- metagenomeSeq::cumNormStatFast(MGS)
+MGS <- metagenomeSeq::cumNorm(MGS, p =p)
+metagenomeSeq::normFactors(MGS) # exports the normalized factors for each sample
+norm.bacteria <- metagenomeSeq::MRcounts(MGS, norm = T)
+norm.bacteria.OTU <- phyloseq::otu_table(norm.bacteria, taxa_are_rows = TRUE)
+
+physeq.css <- phyloseq::phyloseq(norm.bacteria.OTU, SAMP.bacteria, TAX.bacteria, FASTA.bacteria)
+```
+##Beta Diversity
+```{r include=FALSE}
+# Principle coordinates analysis with Bray-Curtis distances
+ordination.pcoa <- ordinate(physeq.css, "PCoA", "bray") # calculate the resemblance and ordinate using PCoA
+ordination.pcoa$vectors # positions of your points on the PCoA graph
+ordination.pcoa$values #values to calculate the variance explained on each axis (dimension)
+
+pcoa <- plot_ordination(physeq.css, ordination = ordination.pcoa, type = "samples", color = "Fungicide", shape = "Time") +
+  theme_classic() + 
+  scale_color_manual(values = cbbPalette)
+
+ordination.pcoa <- ordinate(physeq.css, "DCA", "bray")
+dca <- plot_ordination(physeq.css, ordination = ordination.pcoa, type = "samples", color = "Fungicide", shape = "Time") +
+  theme_classic() + 
+  scale_color_manual(values = cbbPalette)
+```
+```{r pcoa, echo=FALSE}
+plot(pcoa)
+```
+```{r dca, echo=FALSE}
+plot(dca)
+```
+## PERMANOVA
+```{r include=TRUE}
+#testing for differences in centroids
+prok.dist.bray = phyloseq::distance(physeq.css, "bray") # create bray-curtis distance matrix
+adonis2(prok.dist.bray~Time*Fungicide*Cultivar, as(sample_data(physeq.css), "data.frame"))
+```
